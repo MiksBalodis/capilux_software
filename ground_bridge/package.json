@@ -1,0 +1,14 @@
+{
+  "name": "capilux-ground-bridge",
+  "version": "1.0.0",
+  "description": "CAPILUX USB serial to WebSocket bridge",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "@serialport/parser-readline": "^12.0.0",
+    "serialport": "^12.0.0",
+    "ws": "^8.16.0"
+  }
+}
