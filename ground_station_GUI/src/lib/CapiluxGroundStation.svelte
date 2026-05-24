@@ -122,15 +122,18 @@
     { id: "CMD-01", label: "ENTER TEST MODE", command: "ENTER_TEST_MODE", danger: false },
     { id: "CMD-02", label: "EXIT TEST MODE", command: "EXIT_TEST_MODE", danger: false },
     { id: "CMD-03", label: "GET STATUS", command: "GET_STATUS", danger: false },
+
     { id: "CMD-04", label: "GET HK", command: "GET_HK", danger: false },
     { id: "CMD-05", label: "GET OBS STATUS", command: "GET_OBS_STATUS", danger: false },
-    { id: "CMD-06", label: "CAM ON", command: "CAM_ON", danger: false },
-    { id: "CMD-07", label: "CAM OFF", command: "CAM_OFF", danger: false },
-    { id: "CMD-08", label: "LED 120", command: "LED_ALL 120", danger: false },
-    { id: "CMD-09", label: "LED OFF", command: "LED_OFF", danger: false },
-    { id: "CMD-10", label: "START HK", command: "START_HK_STREAM", danger: false },
-    { id: "CMD-11", label: "STOP HK", command: "STOP_HK_STREAM", danger: false },
-    { id: "CMD-12", label: "SAVE MEMORY", command: "SAVE_MEMORY", danger: false },
+    { id: "CMD-06", label: "GET MEMORY", command: "GET_MEMORY_STATUS", danger: false },
+    { id: "CMD-07", label: "CAM ON", command: "CAM_ON", danger: false },
+
+    { id: "CMD-08", label: "CAM OFF", command: "CAM_OFF", danger: false },
+    { id: "CMD-09", label: "LED 120", command: "LED_ALL 120", danger: false },
+    { id: "CMD-10", label: "LED OFF", command: "LED_OFF", danger: false },
+    { id: "CMD-11", label: "SAVE MEMORY", command: "SAVE_MEMORY", danger: false },
+
+    { id: "CMD-12", label: "CLEAR MEMORY", command: "CLEAR_MEMORY", danger: true },
     { id: "CMD-13", label: "SAFE MODE", command: "ENTER_SAFE_MODE", danger: true },
     { id: "CMD-14", label: "EXIT SAFE MODE", command: "EXIT_SAFE_MODE", danger: true },
     { id: "CMD-15", label: "REBOOT", command: "REBOOT", danger: true }
@@ -341,13 +344,10 @@
       {/each}
     </div>
 
-    <div class="top-meta">
-      <div class="mission-time"><span>TIME</span>{missionTime}</div>
-      <div><span>LINK</span>{linkText}</div>
-      {#if lastAck}
-        <div><span>ACK</span>{lastAck.cmd}</div>
-      {/if}
-    </div>
+  <div class="top-meta">
+    <div class="mission-time"><span>TIME</span>{missionTime}</div>
+    <div><span>LINK</span>{linkText}</div>
+  </div>
   </header>
 
   <main class="dashboard">
@@ -666,10 +666,6 @@
 
   h1,
   h2,
-  h3,
-  p {
-    margin: 0;
-  }
 
   h1 {
     margin-top: 2px;
