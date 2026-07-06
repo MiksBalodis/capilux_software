@@ -1,5 +1,5 @@
 #include "lps27hhwt.h"
-#include "../i2c_utils.h"
+#include "i2c_utils.h"
 
 // LPS27HHW register map
 static constexpr uint8_t REG_WHO_AM_I   = 0x0F;

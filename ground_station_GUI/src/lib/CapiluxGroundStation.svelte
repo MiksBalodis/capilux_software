@@ -29,6 +29,23 @@
     board_temp_c?: number;
     pressure_ok?: number;
     pressure_hpa?: number;
+    sensors_ok?: number;
+    ch1_p_hpa?: number | null;
+    ch1_t_c?: number | null;
+    ch2_p_hpa?: number | null;
+    ch2_t_c?: number | null;
+    ch3_p_hpa?: number | null;
+    ch3_t_c?: number | null;
+    ch4_p_hpa?: number | null;
+    ch4_t_c?: number | null;
+    baro_p_hpa?: number | null;
+    baro_t_c?: number | null;
+    ax_g?: number | null;
+    ay_g?: number | null;
+    az_g?: number | null;
+    gx_dps?: number | null;
+    gy_dps?: number | null;
+    gz_dps?: number | null;
     sd_mounted?: number;
     logger_ok?: number;
     memory_free_percent?: number;
@@ -219,13 +236,13 @@
   }
 
   function buildGraphs(currentHk: HkReport | null): GraphItem[] {
-    const pressureAvailable = flagOk(currentHk?.pressure_ok) && isValidNumber(currentHk?.pressure_hpa);
-    const tempAvailable = flagOk(currentHk?.board_temp_ok) && isValidNumber(currentHk?.board_temp_c);
+    const pressureAvailable = isValidNumber(currentHk?.baro_p_hpa);
+    const tempAvailable = isValidNumber(currentHk?.baro_t_c);
 
     return [
       {
         title: "PRESSURE",
-        value: pressureAvailable ? formatNumber(currentHk?.pressure_hpa, "hPa") : "--- hPa",
+        value: pressureAvailable ? formatNumber(currentHk?.baro_p_hpa, "hPa") : "--- hPa",
         subtitle: pressureAvailable ? "real pressure telemetry" : "no pressure data",
         min: "980",
         mid: "1000",
@@ -234,7 +251,7 @@
       },
       {
         title: "BOARD TEMPERATURE",
-        value: tempAvailable ? formatNumber(currentHk?.board_temp_c, "°C") : "--- °C",
+        value: tempAvailable ? formatNumber(currentHk?.baro_t_c, "°C") : "--- °C",
         subtitle: tempAvailable ? "real board temperature" : "no temperature data",
         min: "0",
         mid: "25",
@@ -245,8 +262,8 @@
   }
 
   function buildChambers(currentHk: HkReport | null, currentObs: ObsReport | null, currentStatus: StatusReport | null): ChamberItem[] {
-    const pressureAvailable = flagOk(currentHk?.pressure_ok) && isValidNumber(currentHk?.pressure_hpa);
-    const tempAvailable = flagOk(currentHk?.board_temp_ok) && isValidNumber(currentHk?.board_temp_c);
+    const chP = [currentHk?.ch1_p_hpa, currentHk?.ch2_p_hpa, currentHk?.ch3_p_hpa, currentHk?.ch4_p_hpa];
+    const chT = [currentHk?.ch1_t_c, currentHk?.ch2_t_c, currentHk?.ch3_t_c, currentHk?.ch4_t_c];
 
     const ledValues = [
       currentObs?.led1 ?? currentStatus?.led1,
@@ -262,15 +279,19 @@
       const ledValue = ledValues[ch - 1];
       const ledKnown = typeof ledValue === "number";
 
+      const p = chP[ch - 1];
+      const t = chT[ch - 1];
+      const chamberHasData = isValidNumber(p) || isValidNumber(t);
+
       return {
         id: `CH-${ch}`,
-        pressure: pressureAvailable ? formatNumber(currentHk?.pressure_hpa, "hPa") : "--- hPa",
-        temp: tempAvailable ? formatNumber(currentHk?.board_temp_c, "°C") : "--- °C",
+        pressure: isValidNumber(p) ? formatNumber(p, "hPa") : "--- hPa",
+        temp: isValidNumber(t) ? formatNumber(t, "°C") : "--- °C",
         led: ledKnown ? (ledValue > 0 ? `PWM ${ledValue}` : "OFF") : "---",
         camera: cameraKnown ? (cameraPower ? "POWERED" : "OFF") : "---",
         recording: "---",
         leak: "---",
-        state: pressureAvailable || tempAvailable ? "DATA" : "---"
+        state: chamberHasData ? "DATA" : "---"
       };
     });
   }

@@ -1,5 +1,5 @@
 #include "lsm6dso32.h"
-#include "../i2c_utils.h"
+#include "i2c_utils.h"
 
 static constexpr uint8_t REG_WHO_AM_I = 0x0F;
 static constexpr uint8_t REG_CTRL1_XL = 0x10;

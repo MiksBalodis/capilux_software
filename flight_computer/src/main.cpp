@@ -1,6 +1,12 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
+#include <Wire.h>
+
+#include "i2c_utils.h"
+#include "sensors/lps27hhwt.h"
+#include "sensors/ms5611.h"
+#include "sensors/lsm6dso32.h"
 
 #if defined(ARDUINO_ARCH_RP2040)
   #include "hardware/watchdog.h"
@@ -35,6 +41,18 @@ constexpr int PIN_SRCLK = 20;
 constexpr int PIN_RCLK  = 21;
 constexpr int PIN_OE    = 22;
 constexpr int PIN_SER   = 26;
+
+// I2C buses (SED pinout)
+constexpr int PIN_I2C2_SDA = 2;  // chamber 3/4 LPS27HHWT
+constexpr int PIN_I2C2_SCL = 3;
+constexpr int PIN_I2C1_SDA = 4;  // chamber 1/2 LPS27HHWT + onboard MS5611/LSM6DSO32
+constexpr int PIN_I2C1_SCL = 5;
+
+// I2C addresses
+constexpr uint8_t ADDR_LPS27_LOW  = 0x5C;
+constexpr uint8_t ADDR_LPS27_HIGH = 0x5D;
+constexpr uint8_t ADDR_MS5611     = 0x77;
+constexpr uint8_t ADDR_LSM6DSO32  = 0x6B;
 
 // ---------- Communication ----------
 
@@ -73,7 +91,7 @@ uint32_t commandsReceived = 0;
 uint32_t badCommands = 0;
 
 bool statusStreamEnabled = true;
-bool hkStreamEnabled = false;
+bool hkStreamEnabled = true;
 
 bool cameraPower = false;
 
@@ -86,6 +104,67 @@ bool memorySaved = false;
 uint32_t logLineCounter = 0;
 uint32_t lastSaveMs = 0;
 File logFile;
+
+// ---------- Sensors ----------
+// Wire  = RP2040 I2C0 on GP4/GP5 = SED bus "I2C1" (chambers 1/2 + onboard)
+// Wire1 = RP2040 I2C1 on GP2/GP3 = SED bus "I2C2" (chambers 3/4)
+Lps27hhwt lpsCh1(Wire,  ADDR_LPS27_LOW,  "CH1");
+Lps27hhwt lpsCh2(Wire,  ADDR_LPS27_HIGH, "CH2");
+Lps27hhwt lpsCh3(Wire1, ADDR_LPS27_LOW,  "CH3");
+Lps27hhwt lpsCh4(Wire1, ADDR_LPS27_HIGH, "CH4");
+Ms5611    baro(Wire,  ADDR_MS5611,    "BARO");
+Lsm6dso32 imu(Wire,   ADDR_LSM6DSO32, "IMU");
+
+constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS = 1000;
+uint32_t lastSensorMs = 0;
+
+// Latest cached readings, refreshed once per sample period
+Lps27Reading rCh1, rCh2, rCh3, rCh4;
+Ms5611Reading rBaro;
+ImuReading rImu;
+
+int sensorsOkCount() {
+  return (rCh1.ok ? 1 : 0) + (rCh2.ok ? 1 : 0) + (rCh3.ok ? 1 : 0) +
+         (rCh4.ok ? 1 : 0) + (rBaro.ok ? 1 : 0) + (rImu.ok ? 1 : 0);
+}
+
+void initSensors() {
+  Wire.setSDA(PIN_I2C1_SDA);
+  Wire.setSCL(PIN_I2C1_SCL);
+  Wire.setClock(100000);
+  Wire.begin();
+
+  Wire1.setSDA(PIN_I2C2_SDA);
+  Wire1.setSCL(PIN_I2C2_SCL);
+  Wire1.setClock(100000);
+  Wire1.begin();
+
+  lpsCh1.begin();
+  lpsCh2.begin();
+  lpsCh3.begin();
+  lpsCh4.begin();
+  baro.begin();
+  imu.begin();
+}
+
+void sampleSensors() {
+  // Drivers re-try begin() internally if a sensor was missing,
+  // so disconnected sensors recover automatically when reattached.
+  rCh1 = lpsCh1.read();
+  rCh2 = lpsCh2.read();
+  rCh3 = lpsCh3.read();
+  rCh4 = lpsCh4.read();
+  rBaro = baro.read();
+  rImu = imu.read();
+}
+
+// Print a float JSON value or null when invalid
+void printJsonFloat(const char *key, float v, bool ok, int digits = 2) {
+  Serial.print(",\"");
+  Serial.print(key);
+  Serial.print("\":");
+  if (ok && !isnan(v)) Serial.print(v, digits); else Serial.print("null");
+}
 
 // ---------- Basic helpers ----------
 
@@ -169,7 +248,7 @@ void initShiftRegister() {
 void sendBoot() {
   Serial.print("{\"type\":\"POWER_ON\",\"t_ms\":");
   Serial.print(millis());
-  Serial.print(",\"message\":\"CAPILUX powered on\",\"fw\":\"usb_sd_memory_demo_1\"}");
+  Serial.print(",\"message\":\"CAPILUX powered on\",\"fw\":\"usb_sensors_1\"}");
   Serial.println();
 }
 
@@ -286,22 +365,42 @@ void sendStatus() {
 }
 
 void sendHousekeeping() {
-  /*
-    Sensors are not connected yet, so pressure/temperature/voltage data
-    are intentionally not faked.
-
-    SD/logger status is real.
-  */
-
   Serial.print("{\"type\":\"HK_REPORT\",\"t_ms\":");
   Serial.print(millis());
 
-  Serial.print(",\"hk_ok\":");
-  Serial.print(sdMounted || loggerOk ? 1 : 0);
+  int okCount = sensorsOkCount();
 
+  Serial.print(",\"hk_ok\":");
+  Serial.print(((sdMounted || loggerOk) && okCount == 6) ? 1 : 0);
+
+  // voltage sensing not implemented in hardware yet
   Serial.print(",\"voltage_ok\":0");
-  Serial.print(",\"board_temp_ok\":0");
-  Serial.print(",\"pressure_ok\":0");
+
+  Serial.print(",\"board_temp_ok\":");
+  Serial.print((rBaro.ok && rBaro.temperature_C > 0 && rBaro.temperature_C < 60) ? 1 : 0);
+
+  Serial.print(",\"pressure_ok\":");
+  Serial.print((rCh1.ok && rCh2.ok && rCh3.ok && rCh4.ok) ? 1 : 0);
+
+  Serial.print(",\"sensors_ok\":");
+  Serial.print(okCount);
+
+  printJsonFloat("ch1_p_hpa", rCh1.pressure_hPa, rCh1.ok);
+  printJsonFloat("ch1_t_c",   rCh1.temperature_C, rCh1.ok);
+  printJsonFloat("ch2_p_hpa", rCh2.pressure_hPa, rCh2.ok);
+  printJsonFloat("ch2_t_c",   rCh2.temperature_C, rCh2.ok);
+  printJsonFloat("ch3_p_hpa", rCh3.pressure_hPa, rCh3.ok);
+  printJsonFloat("ch3_t_c",   rCh3.temperature_C, rCh3.ok);
+  printJsonFloat("ch4_p_hpa", rCh4.pressure_hPa, rCh4.ok);
+  printJsonFloat("ch4_t_c",   rCh4.temperature_C, rCh4.ok);
+  printJsonFloat("baro_p_hpa", rBaro.pressure_hPa, rBaro.ok);
+  printJsonFloat("baro_t_c",   rBaro.temperature_C, rBaro.ok);
+  printJsonFloat("ax_g", rImu.ax_g, rImu.ok, 3);
+  printJsonFloat("ay_g", rImu.ay_g, rImu.ok, 3);
+  printJsonFloat("az_g", rImu.az_g, rImu.ok, 3);
+  printJsonFloat("gx_dps", rImu.gx_dps, rImu.ok, 1);
+  printJsonFloat("gy_dps", rImu.gy_dps, rImu.ok, 1);
+  printJsonFloat("gz_dps", rImu.gz_dps, rImu.ok, 1);
 
   Serial.print(",\"sd_mounted\":");
   Serial.print(sdMounted ? 1 : 0);
@@ -315,7 +414,11 @@ void sendHousekeeping() {
   Serial.print(",\"log_bytes\":");
   Serial.print(getLogFileSize());
 
-  Serial.print(",\"sensor_mode\":\"not_connected\"");
+  Serial.print(",\"sensor_mode\":\"");
+  if (okCount == 6) Serial.print("live");
+  else if (okCount > 0) Serial.print("degraded");
+  else Serial.print("not_connected");
+  Serial.print("\"");
 
   Serial.print("}");
   Serial.println();
@@ -376,7 +479,7 @@ bool openLogFile() {
   }
 
   if (newFile || logFile.size() == 0) {
-    logFile.println("log_line,t_ms,state,soe,lo,camera_power,led1,led2,led3,led4,commands_received,bad_commands");
+    logFile.println("log_line,t_ms,state,soe,lo,camera_power,led1,led2,led3,led4,commands_received,bad_commands,ch1_p_hpa,ch1_t_c,ch2_p_hpa,ch2_t_c,ch3_p_hpa,ch3_t_c,ch4_p_hpa,ch4_t_c,baro_p_hpa,baro_t_c,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps");
     logFile.flush();
   }
 
@@ -438,7 +541,20 @@ void appendLogLine() {
   logFile.print(",");
   logFile.print(commandsReceived);
   logFile.print(",");
-  logFile.println(badCommands);
+  logFile.print(badCommands);
+
+  auto csvF = [](float v, bool ok, int digits) {
+    logFile.print(",");
+    if (ok && !isnan(v)) logFile.print(v, digits);
+  };
+  csvF(rCh1.pressure_hPa, rCh1.ok, 2);  csvF(rCh1.temperature_C, rCh1.ok, 2);
+  csvF(rCh2.pressure_hPa, rCh2.ok, 2);  csvF(rCh2.temperature_C, rCh2.ok, 2);
+  csvF(rCh3.pressure_hPa, rCh3.ok, 2);  csvF(rCh3.temperature_C, rCh3.ok, 2);
+  csvF(rCh4.pressure_hPa, rCh4.ok, 2);  csvF(rCh4.temperature_C, rCh4.ok, 2);
+  csvF(rBaro.pressure_hPa, rBaro.ok, 2); csvF(rBaro.temperature_C, rBaro.ok, 2);
+  csvF(rImu.ax_g, rImu.ok, 3); csvF(rImu.ay_g, rImu.ok, 3); csvF(rImu.az_g, rImu.ok, 3);
+  csvF(rImu.gx_dps, rImu.ok, 1); csvF(rImu.gy_dps, rImu.ok, 1); csvF(rImu.gz_dps, rImu.ok, 1);
+  logFile.println();
 
   // For bench testing, flush every line so it is easy to verify.
   logFile.flush();
@@ -740,6 +856,8 @@ void setup() {
   systemState = SystemState::STANDBY;
 
   initSdAndLogger();
+  initSensors();
+  sampleSensors();
 
   sendBoot();
   sendHelp();
@@ -753,6 +871,11 @@ void loop() {
   readCommands();
 
   uint32_t now = millis();
+
+  if (now - lastSensorMs >= SENSOR_SAMPLE_PERIOD_MS) {
+    lastSensorMs = now;
+    sampleSensors();
+  }
 
   if (statusStreamEnabled && now - lastStatusMs >= STATUS_PERIOD_MS) {
     lastStatusMs = now;

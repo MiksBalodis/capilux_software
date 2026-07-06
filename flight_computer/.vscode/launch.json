@@ -16,7 +16,7 @@
             "projectEnvName": "rpipico2",
             "toolchainBinDir": "C:/Users/Miks/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "C:/Users/Miks/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2350.svd",
+            "svdPath": "C:/Users/Miks/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd",
             "preLaunchTask": {
                 "type": "PlatformIO",
                 "task": "Pre-Debug"
@@ -30,7 +30,7 @@
             "projectEnvName": "rpipico2",
             "toolchainBinDir": "C:/Users/Miks/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "C:/Users/Miks/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2350.svd"
+            "svdPath": "C:/Users/Miks/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd"
         },
         {
             "type": "platformio-debug",
@@ -40,7 +40,7 @@
             "projectEnvName": "rpipico2",
             "toolchainBinDir": "C:/Users/Miks/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "C:/Users/Miks/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2350.svd",
+            "svdPath": "C:/Users/Miks/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd",
             "loadMode": "manual"
         }
     ]
