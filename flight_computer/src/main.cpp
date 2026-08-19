@@ -87,6 +87,14 @@ uint32_t lastStatusMs = 0;
 uint32_t lastHkMs = 0;
 uint32_t lastLogMs = 0;
 
+// Watchdog: hardware timer that reboots the MCU if not fed in time.
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 4000;   // reboot if loop stalls > 4 s
+
+// Two-step CLEAR_MEMORY protection (Action 37)
+bool clearArmed = false;
+uint32_t clearArmedAtMs = 0;
+constexpr uint32_t CLEAR_CONFIRM_WINDOW_MS = 10000;  // confirm within 10 s
+
 uint32_t commandsReceived = 0;
 uint32_t badCommands = 0;
 
@@ -245,15 +253,20 @@ void initShiftRegister() {
 
 // ---------- JSON telemetry ----------
 
+// ---- Compact grouped telemetry packets (A2 design) ----
+// Each packet covers one domain and stays within the RXSM-safe size band
+// (<= ~74 B worst case). Type tags: PON,STA,ACT,HK,CH1,CH2,BAR,IMU,MEM,OBS,
+// ACK,ERR,CFR. Field mapping is documented in SED Table (telemetry packets).
+
 void sendBoot() {
-  Serial.print("{\"type\":\"POWER_ON\",\"t_ms\":");
+  Serial.print("{\"ty\":\"PON\",\"ms\":");
   Serial.print(millis());
-  Serial.print(",\"message\":\"CAPILUX powered on\",\"fw\":\"usb_sensors_1\"}");
+  Serial.print(",\"fw\":\"capilux_1\"}");
   Serial.println();
 }
 
 void sendAck(const String& cmd) {
-  Serial.print("{\"type\":\"ACK\",\"t_ms\":");
+  Serial.print("{\"ty\":\"ACK\",\"ms\":");
   Serial.print(millis());
   Serial.print(",\"cmd\":\"");
   Serial.print(cmd);
@@ -262,18 +275,14 @@ void sendAck(const String& cmd) {
 }
 
 void sendError(const String& message, const String& detail = "") {
-  Serial.print("{\"type\":\"ERROR\",\"t_ms\":");
+  Serial.print("{\"ty\":\"ERR\",\"ms\":");
   Serial.print(millis());
-  Serial.print(",\"message\":\"");
+  Serial.print(",\"e\":\"");
   Serial.print(message);
   Serial.print("\"");
-
-  if (detail.length() > 0) {
-    Serial.print(",\"detail\":\"");
-    Serial.print(detail);
-    Serial.print("\"");
-  }
-
+  // detail is kept for the onboard/bench log context but not downlinked
+  // over the flight link to respect packet size limits.
+  (void)detail;
   Serial.print("}");
   Serial.println();
 }
@@ -296,158 +305,147 @@ uint32_t getLogFileSize() {
 }
 
 void sendMemoryReport() {
-  Serial.print("{\"type\":\"MEMORY_REPORT\",\"t_ms\":");
+  Serial.print("{\"ty\":\"MEM\",\"ms\":");
   Serial.print(millis());
-
-  Serial.print(",\"sd_mounted\":");
+  Serial.print(",\"sd\":");
   Serial.print(sdMounted ? 1 : 0);
-
-  Serial.print(",\"logger_ok\":");
+  Serial.print(",\"lg\":");
   Serial.print(loggerOk ? 1 : 0);
-
-  Serial.print(",\"memory_saved\":");
+  Serial.print(",\"sv\":");
   Serial.print(memorySaved ? 1 : 0);
-
-  Serial.print(",\"log_file\":\"");
-  Serial.print(LOG_FILE_PATH);
-  Serial.print("\"");
-
-  Serial.print(",\"log_bytes\":");
+  Serial.print(",\"lb\":");
   Serial.print(getLogFileSize());
-
-  Serial.print(",\"log_lines\":");
+  Serial.print(",\"ll\":");
   Serial.print(logLineCounter);
-
-  Serial.print(",\"last_save_ms\":");
-  Serial.print(lastSaveMs);
-
   Serial.print("}");
   Serial.println();
 }
 
+// STA: core state + inputs.  ACT: actuators + command counters.
 void sendStatus() {
-  Serial.print("{\"type\":\"STATUS_REPORT\",\"t_ms\":");
-  Serial.print(millis());
+  uint32_t ms = millis();
 
-  Serial.print(",\"state\":\"");
+  Serial.print("{\"ty\":\"STA\",\"ms\":");
+  Serial.print(ms);
+  Serial.print(",\"st\":\"");
   Serial.print(stateName(systemState));
-  Serial.print("\"");
-
-  Serial.print(",\"uptime_ms\":");
-  Serial.print(millis() - bootTimeMs);
-
-  Serial.print(",\"soe\":");
+  Serial.print("\",\"soe\":");
   Serial.print(readSOE() ? 1 : 0);
-
   Serial.print(",\"lo\":");
   Serial.print(readLO() ? 1 : 0);
-
-  Serial.print(",\"camera_power\":");
+  Serial.print(",\"cam\":");
   Serial.print(cameraPower ? 1 : 0);
+  Serial.print("}");
+  Serial.println();
 
-  Serial.print(",\"led1\":");
-  Serial.print(ledPwm[0]);
-  Serial.print(",\"led2\":");
-  Serial.print(ledPwm[1]);
-  Serial.print(",\"led3\":");
-  Serial.print(ledPwm[2]);
-  Serial.print(",\"led4\":");
+  Serial.print("{\"ty\":\"ACT\",\"ms\":");
+  Serial.print(ms);
+  Serial.print(",\"led\":[");
+  Serial.print(ledPwm[0]); Serial.print(",");
+  Serial.print(ledPwm[1]); Serial.print(",");
+  Serial.print(ledPwm[2]); Serial.print(",");
   Serial.print(ledPwm[3]);
-
-  Serial.print(",\"commands_received\":");
+  Serial.print("],\"rx\":");
   Serial.print(commandsReceived);
-
-  Serial.print(",\"bad_commands\":");
+  Serial.print(",\"bad\":");
   Serial.print(badCommands);
-
   Serial.print("}");
   Serial.println();
 }
 
-void sendHousekeeping() {
-  Serial.print("{\"type\":\"HK_REPORT\",\"t_ms\":");
-  Serial.print(millis());
+// Sensor value helper: prints v with given decimals, or null when invalid
+void printValOrNull(float v, bool ok, int digits) {
+  if (ok && !isnan(v)) Serial.print(v, digits); else Serial.print("null");
+}
 
+// HK: health flags. CH1/CH2: chamber pair p/T. BAR: onboard baro. IMU: accel+gyro.
+void sendHousekeeping() {
+  uint32_t ms = millis();
   int okCount = sensorsOkCount();
 
-  Serial.print(",\"hk_ok\":");
+  // ---- HK flags ----
+  Serial.print("{\"ty\":\"HK\",\"ms\":");
+  Serial.print(ms);
+  Serial.print(",\"ok\":");
   Serial.print(((sdMounted || loggerOk) && okCount == 6) ? 1 : 0);
-
-  // voltage sensing not implemented in hardware yet
-  Serial.print(",\"voltage_ok\":0");
-
-  Serial.print(",\"board_temp_ok\":");
+  Serial.print(",\"vok\":0");   // voltage sensing not in hardware
+  Serial.print(",\"tok\":");
   Serial.print((rBaro.ok && rBaro.temperature_C > 0 && rBaro.temperature_C < 60) ? 1 : 0);
-
-  Serial.print(",\"pressure_ok\":");
+  Serial.print(",\"pok\":");
   Serial.print((rCh1.ok && rCh2.ok && rCh3.ok && rCh4.ok) ? 1 : 0);
-
-  Serial.print(",\"sensors_ok\":");
+  Serial.print(",\"n\":");
   Serial.print(okCount);
-
-  printJsonFloat("ch1_p_hpa", rCh1.pressure_hPa, rCh1.ok);
-  printJsonFloat("ch1_t_c",   rCh1.temperature_C, rCh1.ok);
-  printJsonFloat("ch2_p_hpa", rCh2.pressure_hPa, rCh2.ok);
-  printJsonFloat("ch2_t_c",   rCh2.temperature_C, rCh2.ok);
-  printJsonFloat("ch3_p_hpa", rCh3.pressure_hPa, rCh3.ok);
-  printJsonFloat("ch3_t_c",   rCh3.temperature_C, rCh3.ok);
-  printJsonFloat("ch4_p_hpa", rCh4.pressure_hPa, rCh4.ok);
-  printJsonFloat("ch4_t_c",   rCh4.temperature_C, rCh4.ok);
-  printJsonFloat("baro_p_hpa", rBaro.pressure_hPa, rBaro.ok);
-  printJsonFloat("baro_t_c",   rBaro.temperature_C, rBaro.ok);
-  printJsonFloat("ax_g", rImu.ax_g, rImu.ok, 3);
-  printJsonFloat("ay_g", rImu.ay_g, rImu.ok, 3);
-  printJsonFloat("az_g", rImu.az_g, rImu.ok, 3);
-  printJsonFloat("gx_dps", rImu.gx_dps, rImu.ok, 1);
-  printJsonFloat("gy_dps", rImu.gy_dps, rImu.ok, 1);
-  printJsonFloat("gz_dps", rImu.gz_dps, rImu.ok, 1);
-
-  Serial.print(",\"sd_mounted\":");
+  Serial.print(",\"sd\":");
   Serial.print(sdMounted ? 1 : 0);
-
-  Serial.print(",\"logger_ok\":");
-  Serial.print(loggerOk ? 1 : 0);
-
-  Serial.print(",\"memory_saved\":");
-  Serial.print(memorySaved ? 1 : 0);
-
-  Serial.print(",\"log_bytes\":");
-  Serial.print(getLogFileSize());
-
-  Serial.print(",\"sensor_mode\":\"");
+  Serial.print(",\"md\":\"");
   if (okCount == 6) Serial.print("live");
   else if (okCount > 0) Serial.print("degraded");
-  else Serial.print("not_connected");
-  Serial.print("\"");
+  else Serial.print("none");
+  Serial.print("\"}");
+  Serial.println();
 
+  // ---- CH1: chambers 1/2 ----
+  Serial.print("{\"ty\":\"CH1\",\"ms\":");
+  Serial.print(ms);
+  Serial.print(",\"p\":[");
+  printValOrNull(rCh1.pressure_hPa, rCh1.ok, 1); Serial.print(",");
+  printValOrNull(rCh2.pressure_hPa, rCh2.ok, 1);
+  Serial.print("],\"t\":[");
+  printValOrNull(rCh1.temperature_C, rCh1.ok, 1); Serial.print(",");
+  printValOrNull(rCh2.temperature_C, rCh2.ok, 1);
+  Serial.print("]}");
+  Serial.println();
+
+  // ---- CH2: chambers 3/4 ----
+  Serial.print("{\"ty\":\"CH2\",\"ms\":");
+  Serial.print(ms);
+  Serial.print(",\"p\":[");
+  printValOrNull(rCh3.pressure_hPa, rCh3.ok, 1); Serial.print(",");
+  printValOrNull(rCh4.pressure_hPa, rCh4.ok, 1);
+  Serial.print("],\"t\":[");
+  printValOrNull(rCh3.temperature_C, rCh3.ok, 1); Serial.print(",");
+  printValOrNull(rCh4.temperature_C, rCh4.ok, 1);
+  Serial.print("]}");
+  Serial.println();
+
+  // ---- BAR: onboard barometer ----
+  Serial.print("{\"ty\":\"BAR\",\"ms\":");
+  Serial.print(ms);
+  Serial.print(",\"bp\":");
+  printValOrNull(rBaro.pressure_hPa, rBaro.ok, 1);
+  Serial.print(",\"bt\":");
+  printValOrNull(rBaro.temperature_C, rBaro.ok, 1);
   Serial.print("}");
+  Serial.println();
+
+  // ---- IMU: accel [g], gyro [dps] ----
+  Serial.print("{\"ty\":\"IMU\",\"ms\":");
+  Serial.print(ms);
+  Serial.print(",\"a\":[");
+  printValOrNull(rImu.ax_g, rImu.ok, 2); Serial.print(",");
+  printValOrNull(rImu.ay_g, rImu.ok, 2); Serial.print(",");
+  printValOrNull(rImu.az_g, rImu.ok, 2);
+  Serial.print("],\"g\":[");
+  printValOrNull(rImu.gx_dps, rImu.ok, 0); Serial.print(",");
+  printValOrNull(rImu.gy_dps, rImu.ok, 0); Serial.print(",");
+  printValOrNull(rImu.gz_dps, rImu.ok, 0);
+  Serial.print("]}");
   Serial.println();
 }
 
 void sendObservationStatus() {
-  Serial.print("{\"type\":\"OBS_REPORT\",\"t_ms\":");
+  Serial.print("{\"ty\":\"OBS\",\"ms\":");
   Serial.print(millis());
-
-  Serial.print(",\"camera_power\":");
+  Serial.print(",\"cam\":");
   Serial.print(cameraPower ? 1 : 0);
-
-  Serial.print(",\"camera_status\":\"");
+  Serial.print(",\"cs\":\"");
   Serial.print(cameraPower ? "POWERED" : "OFF");
-  Serial.print("\"");
-
-  Serial.print(",\"led1\":");
-  Serial.print(ledPwm[0]);
-
-  Serial.print(",\"led2\":");
-  Serial.print(ledPwm[1]);
-
-  Serial.print(",\"led3\":");
-  Serial.print(ledPwm[2]);
-
-  Serial.print(",\"led4\":");
+  Serial.print("\",\"led\":[");
+  Serial.print(ledPwm[0]); Serial.print(",");
+  Serial.print(ledPwm[1]); Serial.print(",");
+  Serial.print(ledPwm[2]); Serial.print(",");
   Serial.print(ledPwm[3]);
-
-  Serial.print("}");
+  Serial.print("]}");
   Serial.println();
 }
 
@@ -674,6 +672,7 @@ void handleCommand(String cmdRaw) {
   cmd.toUpperCase();
 
   String base = getToken(cmd, 0);
+  String arg  = getToken(cmd, 1);
 
   if (base == "PING") {
     sendAck("PING");
@@ -790,16 +789,36 @@ void handleCommand(String cmdRaw) {
     sendMemoryReport();
   }
   else if (base == "CLEAR_MEMORY") {
-    bool ok = clearMemory();
-
-    if (ok) {
-      sendAck("CLEAR_MEMORY");
-    } else {
+    // Two-step confirmation to protect against accidental memory wiping (Action 37).
+    // CLEAR_MEMORY only arms the operation; the actual wipe requires
+    // CLEAR_MEMORY CONFIRM within CLEAR_CONFIRM_WINDOW_MS.
+    // Clearing is inhibited once the flight sequence has started.
+    if (systemState == SystemState::STREAMING) {
       badCommands++;
-      sendError("clear_memory_failed", "Clear is blocked during STREAMING or SD is unavailable");
+      sendError("clear_memory_blocked", "CLEAR_MEMORY is inhibited during STREAMING");
+    } else if (arg == "CONFIRM") {
+      if (clearArmed && (millis() - clearArmedAtMs <= CLEAR_CONFIRM_WINDOW_MS)) {
+        clearArmed = false;
+        bool ok = clearMemory();
+        if (ok) {
+          sendAck("CLEAR_MEMORY CONFIRM");
+        } else {
+          badCommands++;
+          sendError("clear_memory_failed", "Check SD card and logger state");
+        }
+        sendMemoryReport();
+      } else {
+        badCommands++;
+        sendError("clear_not_armed", "Send CLEAR_MEMORY first, then CLEAR_MEMORY CONFIRM within 10 s");
+      }
+    } else {
+      // First step: arm and ask for confirmation
+      clearArmed = true;
+      clearArmedAtMs = millis();
+      Serial.print("{\"ty\":\"CFR\",\"ms\":");
+      Serial.print(millis());
+      Serial.println(",\"cmd\":\"CLEAR_MEMORY\",\"win\":10000}");
     }
-
-    sendMemoryReport();
   }
   else if (base == "REBOOT") {
     requestReboot();
@@ -855,6 +874,12 @@ void setup() {
 
   systemState = SystemState::STANDBY;
 
+  // Arm the hardware watchdog. If the main loop stalls for longer than
+  // WATCHDOG_TIMEOUT_MS the RP2040 reboots automatically.
+#if defined(ARDUINO_ARCH_RP2040)
+  watchdog_enable(WATCHDOG_TIMEOUT_MS, 1);
+#endif
+
   initSdAndLogger();
   initSensors();
   sampleSensors();
@@ -868,6 +893,15 @@ void setup() {
 }
 
 void loop() {
+#if defined(ARDUINO_ARCH_RP2040)
+  watchdog_update();   // feed the watchdog every loop iteration
+#endif
+
+  // Expire an un-confirmed CLEAR_MEMORY arm request (Action 37)
+  if (clearArmed && (millis() - clearArmedAtMs > CLEAR_CONFIRM_WINDOW_MS)) {
+    clearArmed = false;
+  }
+
   readCommands();
 
   uint32_t now = millis();

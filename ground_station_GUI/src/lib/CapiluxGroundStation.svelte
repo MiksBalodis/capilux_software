@@ -151,6 +151,7 @@
     { id: "CMD-11", label: "SAVE MEMORY", command: "SAVE_MEMORY", danger: false },
 
     { id: "CMD-12", label: "CLEAR MEMORY", command: "CLEAR_MEMORY", danger: true },
+    { id: "CMD-12b", label: "CLEAR CONFIRM", command: "CLEAR_MEMORY CONFIRM", danger: true },
     { id: "CMD-13", label: "SAFE MODE", command: "ENTER_SAFE_MODE", danger: true },
     { id: "CMD-14", label: "EXIT SAFE MODE", command: "EXIT_SAFE_MODE", danger: true },
     { id: "CMD-15", label: "REBOOT", command: "REBOOT", danger: true }
@@ -310,19 +311,120 @@
     addRawLine(`GUI    TX     ${command}`);
   }
 
+  // Compact grouped packets (A2 telemetry design).
+  // Type tags: PON,STA,ACT,HK,CH1,CH2,BAR,IMU,MEM,OBS,ACK,ERR,CFR.
+  // Incoming packets are merged into the existing internal model so the
+  // dashboard build functions stay unchanged.
+  function num(v: unknown): number | null {
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+
   function handleIncomingTelemetry(text: string): void {
     addRawLine(`RX     ${text}`);
 
     try {
-      const packet = JSON.parse(text);
+      const p = JSON.parse(text);
+      const ty = p.ty ?? p.type;
+      const ms = p.ms ?? p.t_ms ?? 0;
 
-      if (packet.type === "STATUS_REPORT") status = packet as StatusReport;
-      else if (packet.type === "HK_REPORT") hk = packet as HkReport;
-      else if (packet.type === "OBS_REPORT") obs = packet as ObsReport;
-      else if (packet.type === "ACK") lastAck = packet as AckReport;
+      if (ty === "STA") {
+        status = {
+          ...(status ?? emptyStatus()),
+          t_ms: ms,
+          uptime_ms: ms,
+          state: p.st ?? "",
+          soe: p.soe ?? 0,
+          lo: p.lo ?? 0,
+          camera_power: p.cam ?? 0
+        };
+      } else if (ty === "ACT") {
+        status = {
+          ...(status ?? emptyStatus()),
+          t_ms: ms,
+          led1: p.led?.[0] ?? 0,
+          led2: p.led?.[1] ?? 0,
+          led3: p.led?.[2] ?? 0,
+          led4: p.led?.[3] ?? 0,
+          commands_received: p.rx ?? 0,
+          bad_commands: p.bad ?? 0
+        };
+      } else if (ty === "HK") {
+        hk = {
+          ...(hk ?? emptyHk()),
+          t_ms: ms,
+          hk_ok: p.ok,
+          voltage_ok: p.vok,
+          board_temp_ok: p.tok,
+          pressure_ok: p.pok,
+          sensors_ok: p.n,
+          sd_mounted: p.sd,
+          sensor_mode: p.md
+        };
+      } else if (ty === "CH1") {
+        hk = {
+          ...(hk ?? emptyHk()),
+          t_ms: ms,
+          ch1_p_hpa: num(p.p?.[0]),
+          ch2_p_hpa: num(p.p?.[1]),
+          ch1_t_c: num(p.t?.[0]),
+          ch2_t_c: num(p.t?.[1])
+        };
+      } else if (ty === "CH2") {
+        hk = {
+          ...(hk ?? emptyHk()),
+          t_ms: ms,
+          ch3_p_hpa: num(p.p?.[0]),
+          ch4_p_hpa: num(p.p?.[1]),
+          ch3_t_c: num(p.t?.[0]),
+          ch4_t_c: num(p.t?.[1])
+        };
+      } else if (ty === "BAR") {
+        hk = { ...(hk ?? emptyHk()), t_ms: ms, baro_p_hpa: num(p.bp), baro_t_c: num(p.bt) };
+      } else if (ty === "IMU") {
+        hk = {
+          ...(hk ?? emptyHk()),
+          t_ms: ms,
+          ax_g: num(p.a?.[0]),
+          ay_g: num(p.a?.[1]),
+          az_g: num(p.a?.[2]),
+          gx_dps: num(p.g?.[0]),
+          gy_dps: num(p.g?.[1]),
+          gz_dps: num(p.g?.[2])
+        };
+      } else if (ty === "MEM") {
+        hk = { ...(hk ?? emptyHk()), t_ms: ms, sd_mounted: p.sd, logger_ok: p.lg };
+      } else if (ty === "OBS") {
+        obs = {
+          type: "OBS_REPORT",
+          t_ms: ms,
+          camera_power: p.cam ?? 0,
+          camera_status: p.cs ?? "---",
+          led1: p.led?.[0] ?? 0,
+          led2: p.led?.[1] ?? 0,
+          led3: p.led?.[2] ?? 0,
+          led4: p.led?.[3] ?? 0
+        };
+      } else if (ty === "ACK") {
+        lastAck = { type: "ACK", t_ms: ms, cmd: p.cmd ?? "" };
+      } else if (ty === "CFR") {
+        addRawLine(`GUI    CONFIRM  ${p.cmd} requires confirmation within ${(p.win ?? 10000) / 1000} s`);
+      }
+      // PON / ERR / HELP appear in the raw log only
     } catch {
       addRawLine(`GUI    ERROR  Invalid JSON: ${text}`);
     }
+  }
+
+  function emptyStatus(): StatusReport {
+    return {
+      type: "STATUS_REPORT", t_ms: 0, state: "", uptime_ms: 0, soe: 0, lo: 0,
+      camera_power: 0, led1: 0, led2: 0, led3: 0, led4: 0,
+      commands_received: 0, bad_commands: 0
+    };
+  }
+
+  function emptyHk(): HkReport {
+    return { type: "HK_REPORT", t_ms: 0 };
   }
 
   onMount(() => {
