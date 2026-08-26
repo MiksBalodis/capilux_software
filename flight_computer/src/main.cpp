@@ -12,11 +12,7 @@
   #include "hardware/watchdog.h"
 #endif
 
-// ============================================================
 // CAPILUX command/telemetry firmware
-// Current bench transport: USB CDC Serial
-// Future transport: Serial1 via RS-422
-// ============================================================
 
 // ---------- Pin mapping ----------
 
@@ -75,7 +71,9 @@ enum class SystemState {
   STANDBY,
   TEST_MODE,
   SAFE_MODE,
-  STREAMING
+  STREAMING,
+  EXPERIMENT_ACTIVE, 
+  SAFE_SHUTDOWN
 };
 
 SystemState systemState = SystemState::BOOT;
@@ -87,13 +85,11 @@ uint32_t lastStatusMs = 0;
 uint32_t lastHkMs = 0;
 uint32_t lastLogMs = 0;
 
-// Watchdog: hardware timer that reboots the MCU if not fed in time.
-constexpr uint32_t WATCHDOG_TIMEOUT_MS = 4000;   // reboot if loop stalls > 4 s
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 4000;
 
-// Two-step CLEAR_MEMORY protection (Action 37)
 bool clearArmed = false;
 uint32_t clearArmedAtMs = 0;
-constexpr uint32_t CLEAR_CONFIRM_WINDOW_MS = 10000;  // confirm within 10 s
+constexpr uint32_t CLEAR_CONFIRM_WINDOW_MS = 5000;
 
 uint32_t commandsReceived = 0;
 uint32_t badCommands = 0;
@@ -114,8 +110,6 @@ uint32_t lastSaveMs = 0;
 File logFile;
 
 // ---------- Sensors ----------
-// Wire  = RP2040 I2C0 on GP4/GP5 = SED bus "I2C1" (chambers 1/2 + onboard)
-// Wire1 = RP2040 I2C1 on GP2/GP3 = SED bus "I2C2" (chambers 3/4)
 Lps27hhwt lpsCh1(Wire,  ADDR_LPS27_LOW,  "CH1");
 Lps27hhwt lpsCh2(Wire,  ADDR_LPS27_HIGH, "CH2");
 Lps27hhwt lpsCh3(Wire1, ADDR_LPS27_LOW,  "CH3");
@@ -126,7 +120,6 @@ Lsm6dso32 imu(Wire,   ADDR_LSM6DSO32, "IMU");
 constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS = 1000;
 uint32_t lastSensorMs = 0;
 
-// Latest cached readings, refreshed once per sample period
 Lps27Reading rCh1, rCh2, rCh3, rCh4;
 Ms5611Reading rBaro;
 ImuReading rImu;
@@ -156,8 +149,6 @@ void initSensors() {
 }
 
 void sampleSensors() {
-  // Drivers re-try begin() internally if a sensor was missing,
-  // so disconnected sensors recover automatically when reattached.
   rCh1 = lpsCh1.read();
   rCh2 = lpsCh2.read();
   rCh3 = lpsCh3.read();
@@ -166,7 +157,6 @@ void sampleSensors() {
   rImu = imu.read();
 }
 
-// Print a float JSON value or null when invalid
 void printJsonFloat(const char *key, float v, bool ok, int digits = 2) {
   Serial.print(",\"");
   Serial.print(key);
@@ -183,6 +173,8 @@ const char* stateName(SystemState s) {
     case SystemState::TEST_MODE: return "TEST_MODE";
     case SystemState::SAFE_MODE: return "SAFE_MODE";
     case SystemState::STREAMING: return "STREAMING";
+    case SystemState::EXPERIMENT_ACTIVE: return "EXPERIMENT_ACTIVE";
+    case SystemState::SAFE_SHUTDOWN: return "SAFE_SHUTDOWN";
     default: return "UNKNOWN";
   }
 }
@@ -193,6 +185,67 @@ bool readSOE() {
 
 bool readLO() {
   return digitalRead(PIN_LO_ISO) == HIGH;
+}
+
+// ---------- Autonomous flight sequence (SOE-driven) ----------
+constexpr uint32_t EXP_END_MS = 150000;
+
+constexpr uint32_t SOE_DEBOUNCE_MS = 50;
+
+uint32_t soeStartMs = 0;
+uint32_t soeAssertedSinceMs = 0;
+bool     soeWasAsserted = false;
+bool     loLatched = false;
+
+void setAllLeds(uint8_t value);
+void setCameraPower(bool enabled);
+bool saveMemory();
+void closeLogFile();
+
+void startExperiment() {
+  systemState = SystemState::EXPERIMENT_ACTIVE;
+  soeStartMs = millis();
+  setCameraPower(true);
+  setAllLeds(255);
+  hkStreamEnabled = true;   // ensure data is downlinked during the experiment
+  Serial.println("{\"type\":\"EVENT\",\"event\":\"SOE\",\"msg\":\"experiment started\"}");
+}
+
+void endExperiment() {
+  saveMemory();
+  closeLogFile();
+  setCameraPower(false);
+  setAllLeds(0);
+  systemState = SystemState::SAFE_SHUTDOWN;
+  Serial.println("{\"type\":\"EVENT\",\"event\":\"EXP_END\",\"msg\":\"recording stopped, safe shutdown\"}");
+}
+
+void runFlightSequence() {
+  uint32_t now = millis();
+  bool soe = readSOE();
+
+  if (!loLatched && readLO()) {
+    loLatched = true;
+    Serial.println("{\"type\":\"EVENT\",\"event\":\"LO\",\"msg\":\"lift-off signal recorded\"}");
+  }
+
+  if (systemState == SystemState::STANDBY) {
+    if (soe) {
+      if (!soeWasAsserted) {
+        soeWasAsserted = true;
+        soeAssertedSinceMs = now;
+      } else if (now - soeAssertedSinceMs >= SOE_DEBOUNCE_MS) {
+        startExperiment();
+      }
+    } else {
+      soeWasAsserted = false;
+    }
+  }
+  else if (systemState == SystemState::EXPERIMENT_ACTIVE) {
+    if (now - soeStartMs >= EXP_END_MS) {
+      endExperiment();
+    }
+  }
 }
 
 void setLed(uint8_t channel, uint8_t value) {
@@ -245,18 +298,12 @@ void initShiftRegister() {
   digitalWrite(PIN_RCLK, LOW);
   digitalWrite(PIN_SER, LOW);
 
-  // 74HC595 OE is active-low.
   digitalWrite(PIN_OE, LOW);
 
   shiftRegisterWrite(0x00);
 }
 
 // ---------- JSON telemetry ----------
-
-// ---- Compact grouped telemetry packets (A2 design) ----
-// Each packet covers one domain and stays within the RXSM-safe size band
-// (<= ~74 B worst case). Type tags: PON,STA,ACT,HK,CH1,CH2,BAR,IMU,MEM,OBS,
-// ACK,ERR,CFR. Field mapping is documented in SED Table (telemetry packets).
 
 void sendBoot() {
   Serial.print("{\"ty\":\"PON\",\"ms\":");
@@ -280,8 +327,6 @@ void sendError(const String& message, const String& detail = "") {
   Serial.print(",\"e\":\"");
   Serial.print(message);
   Serial.print("\"");
-  // detail is kept for the onboard/bench log context but not downlinked
-  // over the flight link to respect packet size limits.
   (void)detail;
   Serial.print("}");
   Serial.println();
@@ -321,7 +366,6 @@ void sendMemoryReport() {
   Serial.println();
 }
 
-// STA: core state + inputs.  ACT: actuators + command counters.
 void sendStatus() {
   uint32_t ms = millis();
 
@@ -353,12 +397,10 @@ void sendStatus() {
   Serial.println();
 }
 
-// Sensor value helper: prints v with given decimals, or null when invalid
 void printValOrNull(float v, bool ok, int digits) {
   if (ok && !isnan(v)) Serial.print(v, digits); else Serial.print("null");
 }
 
-// HK: health flags. CH1/CH2: chamber pair p/T. BAR: onboard baro. IMU: accel+gyro.
 void sendHousekeeping() {
   uint32_t ms = millis();
   int okCount = sensorsOkCount();
@@ -554,7 +596,6 @@ void appendLogLine() {
   csvF(rImu.gx_dps, rImu.ok, 1); csvF(rImu.gy_dps, rImu.ok, 1); csvF(rImu.gz_dps, rImu.ok, 1);
   logFile.println();
 
-  // For bench testing, flush every line so it is easy to verify.
   logFile.flush();
 }
 
@@ -593,7 +634,9 @@ bool clearMemory() {
     return false;
   }
 
-  if (systemState == SystemState::STREAMING) {
+  if (systemState == SystemState::STREAMING ||
+      systemState == SystemState::EXPERIMENT_ACTIVE ||
+      systemState == SystemState::SAFE_SHUTDOWN) {
     return false;
   }
 
@@ -665,6 +708,15 @@ void handleCommand(String cmdRaw) {
   cmdRaw.trim();
 
   if (cmdRaw.length() == 0) return;
+
+  for (size_t i = 0; i < cmdRaw.length(); i++) {
+    char c = cmdRaw[i];
+    if (c < 0x20 || c > 0x7E) {
+      badCommands++;
+      sendError("corrupted_command");
+      return;
+    }
+  }
 
   commandsReceived++;
 
@@ -789,11 +841,9 @@ void handleCommand(String cmdRaw) {
     sendMemoryReport();
   }
   else if (base == "CLEAR_MEMORY") {
-    // Two-step confirmation to protect against accidental memory wiping (Action 37).
-    // CLEAR_MEMORY only arms the operation; the actual wipe requires
-    // CLEAR_MEMORY CONFIRM within CLEAR_CONFIRM_WINDOW_MS.
-    // Clearing is inhibited once the flight sequence has started.
-    if (systemState == SystemState::STREAMING) {
+    if (systemState == SystemState::STREAMING ||
+      systemState == SystemState::EXPERIMENT_ACTIVE ||
+      systemState == SystemState::SAFE_SHUTDOWN) {
       badCommands++;
       sendError("clear_memory_blocked", "CLEAR_MEMORY is inhibited during STREAMING");
     } else if (arg == "CONFIRM") {
@@ -812,7 +862,6 @@ void handleCommand(String cmdRaw) {
         sendError("clear_not_armed", "Send CLEAR_MEMORY first, then CLEAR_MEMORY CONFIRM within 10 s");
       }
     } else {
-      // First step: arm and ask for confirmation
       clearArmed = true;
       clearArmedAtMs = millis();
       Serial.print("{\"ty\":\"CFR\",\"ms\":");
@@ -834,10 +883,17 @@ void readCommands() {
     char c = (char)Serial.read();
 
     if (c == '\n') {
-      handleCommand(commandBuffer);
+      if (commandBuffer.length() > 0) {
+        handleCommand(commandBuffer);
+        commandBuffer = "";
+      }
+    }
+    else if (c == '\r') {
+    }
+    else if (c < 0x20 || c > 0x7E) {
       commandBuffer = "";
     }
-    else if (c != '\r') {
+    else {
       if (commandBuffer.length() < MAX_COMMAND_LENGTH) {
         commandBuffer += c;
       } else {
@@ -874,8 +930,6 @@ void setup() {
 
   systemState = SystemState::STANDBY;
 
-  // Arm the hardware watchdog. If the main loop stalls for longer than
-  // WATCHDOG_TIMEOUT_MS the RP2040 reboots automatically.
 #if defined(ARDUINO_ARCH_RP2040)
   watchdog_enable(WATCHDOG_TIMEOUT_MS, 1);
 #endif
@@ -894,15 +948,16 @@ void setup() {
 
 void loop() {
 #if defined(ARDUINO_ARCH_RP2040)
-  watchdog_update();   // feed the watchdog every loop iteration
+  watchdog_update();
 #endif
 
-  // Expire an un-confirmed CLEAR_MEMORY arm request (Action 37)
   if (clearArmed && (millis() - clearArmedAtMs > CLEAR_CONFIRM_WINDOW_MS)) {
     clearArmed = false;
   }
 
   readCommands();
+
+  runFlightSequence();
 
   uint32_t now = millis();
 
