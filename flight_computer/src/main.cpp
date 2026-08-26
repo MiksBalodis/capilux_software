@@ -12,7 +12,9 @@
   #include "hardware/watchdog.h"
 #endif
 
+// ============================================================
 // CAPILUX command/telemetry firmware
+// ============================================================
 
 // ---------- Pin mapping ----------
 
@@ -39,9 +41,9 @@ constexpr int PIN_OE    = 22;
 constexpr int PIN_SER   = 26;
 
 // I2C buses (SED pinout)
-constexpr int PIN_I2C2_SDA = 2;  // chamber 3/4 LPS27HHWT
+constexpr int PIN_I2C2_SDA = 2;
 constexpr int PIN_I2C2_SCL = 3;
-constexpr int PIN_I2C1_SDA = 4;  // chamber 1/2 LPS27HHWT + onboard MS5611/LSM6DSO32
+constexpr int PIN_I2C1_SDA = 4;
 constexpr int PIN_I2C1_SCL = 5;
 
 // I2C addresses
@@ -53,8 +55,8 @@ constexpr uint8_t ADDR_LSM6DSO32  = 0x6B;
 // ---------- Communication ----------
 
 constexpr uint32_t LINK_BAUD = 115200;
-constexpr uint32_t STATUS_PERIOD_MS = 1000;
-constexpr uint32_t HK_PERIOD_MS = 1000;
+constexpr uint32_t STATUS_PERIOD_MS = 0;
+constexpr uint32_t HK_PERIOD_MS = 0;
 constexpr uint32_t LOG_PERIOD_MS = 1000;
 constexpr uint32_t MAX_COMMAND_LENGTH = 96;
 
@@ -72,7 +74,7 @@ enum class SystemState {
   TEST_MODE,
   SAFE_MODE,
   STREAMING,
-  EXPERIMENT_ACTIVE, 
+  EXPERIMENT_ACTIVE,
   SAFE_SHUTDOWN
 };
 
@@ -89,7 +91,7 @@ constexpr uint32_t WATCHDOG_TIMEOUT_MS = 4000;
 
 bool clearArmed = false;
 uint32_t clearArmedAtMs = 0;
-constexpr uint32_t CLEAR_CONFIRM_WINDOW_MS = 5000;
+constexpr uint32_t CLEAR_CONFIRM_WINDOW_MS = 10000;
 
 uint32_t commandsReceived = 0;
 uint32_t badCommands = 0;
@@ -117,7 +119,7 @@ Lps27hhwt lpsCh4(Wire1, ADDR_LPS27_HIGH, "CH4");
 Ms5611    baro(Wire,  ADDR_MS5611,    "BARO");
 Lsm6dso32 imu(Wire,   ADDR_LSM6DSO32, "IMU");
 
-constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS = 1000;
+constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS = 100;
 uint32_t lastSensorMs = 0;
 
 Lps27Reading rCh1, rCh2, rCh3, rCh4;
@@ -194,8 +196,8 @@ constexpr uint32_t SOE_DEBOUNCE_MS = 50;
 
 uint32_t soeStartMs = 0;
 uint32_t soeAssertedSinceMs = 0;
-bool     soeWasAsserted = false;
-bool     loLatched = false;
+bool soeWasAsserted = false;
+bool loLatched = false;
 
 void setAllLeds(uint8_t value);
 void setCameraPower(bool enabled);
@@ -207,7 +209,7 @@ void startExperiment() {
   soeStartMs = millis();
   setCameraPower(true);
   setAllLeds(255);
-  hkStreamEnabled = true;   // ensure data is downlinked during the experiment
+  hkStreamEnabled = true;
   Serial.println("{\"type\":\"EVENT\",\"event\":\"SOE\",\"msg\":\"experiment started\"}");
 }
 
@@ -410,7 +412,7 @@ void sendHousekeeping() {
   Serial.print(ms);
   Serial.print(",\"ok\":");
   Serial.print(((sdMounted || loggerOk) && okCount == 6) ? 1 : 0);
-  Serial.print(",\"vok\":0");   // voltage sensing not in hardware
+  Serial.print(",\"vok\":0");
   Serial.print(",\"tok\":");
   Serial.print((rBaro.ok && rBaro.temperature_C > 0 && rBaro.temperature_C < 60) ? 1 : 0);
   Serial.print(",\"pok\":");
@@ -862,6 +864,7 @@ void handleCommand(String cmdRaw) {
         sendError("clear_not_armed", "Send CLEAR_MEMORY first, then CLEAR_MEMORY CONFIRM within 10 s");
       }
     } else {
+      // First step: arm and ask for confirmation
       clearArmed = true;
       clearArmedAtMs = millis();
       Serial.print("{\"ty\":\"CFR\",\"ms\":");
@@ -889,6 +892,7 @@ void readCommands() {
       }
     }
     else if (c == '\r') {
+      // ignore
     }
     else if (c < 0x20 || c > 0x7E) {
       commandBuffer = "";
