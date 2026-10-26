@@ -439,7 +439,7 @@ static void hold() {
   at(D, [] { setLo(true); });
   runUntil(PWR_OFF + D);
   CHECK(near(evt("SOE_RELEASED"), -29, 0.2), "SOE release detected at T%+.1f", evt("SOE_RELEASED"));
-  CHECK(near(camOffAfter(-31), -26, 0.2), "cameras stopped and off at T%+.1f", camOffAfter(-31));
+  CHECK(near(camOffAfter(-31), T_ALL_OFF + D, 0.2), "cameras keep recording through the hold (off only at the end, T%+.1f new count)", camOffAfter(-31) - D);
   CHECK(first("STA", "st", "STANDBY", -29) < -25, "back to STANDBY, re-armed");
   CHECK(near(evt("SOE", 0), SOE + D, 0.1), "second SOE starts a fresh flight");
   CHECK(near(evt("EXP_END", 0), T_STOP_CMD + D, 0.2), "end timed from the second SOE: T%+.1f (new count)", evt("EXP_END", 0) - D);
@@ -679,6 +679,60 @@ static void extras() {
   dipAt = 1e9;
 }
 
+// New timeline: the test at T-6:00 starts the recording, it runs through the countdown,
+// and SOE gives the final checks with GO / NO-GO.
+static void preflightRec() {
+  printf("\n[10] Recording from the test at T-6:00, final checks at SOE\n");
+  resetWorld();
+  powerOn();
+  at(-360, [] { send("ENTER_TEST_MODE"); });
+  at(-300, [] { send("EXIT_TEST_MODE"); });
+  at(-200, [] { hang(); });  // a watchdog reset in the middle of the pre-flight recording
+  at(SOE, [] { setSoe(true); });
+  at(0, [] { setLo(true); });
+  runUntil(-335);
+  int on = 1;
+  for (int i = 0; i < 8; i++) on &= cam[i].rec;
+  CHECK(pinOut[PIN_CAM_EN] && on && count("EVT", "e", "REC_OK_7") == 1, "ENTER_TEST_MODE: cameras on, all 8 confirmed recording within 25 s");
+  CHECK(ledPwm[PIN_CH_LED[0]] == LED_FLIGHT, "LEDs on at flight level");
+  runUntil(-290);
+  CHECK(lastSt() == "STANDBY" && count("EVT", "e", "PREFLIGHT_REC") == 1 && pinOut[PIN_CAM_EN], "EXIT_TEST_MODE: back to STANDBY, cameras keep recording");
+  runUntil(-190);
+  double off = NAN, back = NAN;
+  for (auto &c : camEnLog) {
+    if (c.first > -201 && !c.second && std::isnan(off)) off = c.first;
+    else if (!std::isnan(off) && c.second && std::isnan(back)) back = c.first;
+  }
+  CHECK(count("EVT", "e", "RESUME_REC") == 1 && back - off < 0.01, "watchdog reset at T-200: recording resumed, CAM_EN gap %.0f ms", (back - off) * 1000);
+  runUntil(SOE + 1);
+  std::string sts;
+  for (auto &p : pkts) if (field(p.s, "t") == "STS" && p.t >= SOE - 0.1) { sts = p.s; break; }
+  CHECK(!sts.empty() && field(sts, "c") == "255" && field(sts, "r") == "255", "SOE: final check sent, all cameras answer and record");
+  CHECK(count("EVT", "e", "NOGO", SOE - 0.1) == 1, "GO/NO-GO event at SOE (NO-GO here: the sim has no chamber sensors or barometer)");
+  runUntil(PWR_OFF);
+  CHECK(near(evt("EXP_END"), T_STOP_CMD, 0.2) && near(camOffAfter(-150), T_ALL_OFF, 0.2), "recording stops at T%+.1f, all off T%+.1f", evt("EXP_END"), camOffAfter(-150));
+  CHECK(cam[0].recSec > 900, "one recording from the test to the end: %.0f s", cam[0].recSec);
+
+  printf("\n[10b] No uplink: the test never happens, SOE starts the cameras\n");
+  resetWorld();
+  powerOn();
+  at(SOE, [] { setSoe(true); });
+  runUntil(SOE + 1);
+  CHECK(pinOut[PIN_CAM_EN] && count("EVT", "e", "NOGO") == 1, "SOE powers the cameras as a fallback, final check says NO-GO (cameras not recording yet)");
+  runUntil(SOE + 20);
+  int all = 1;
+  for (int i = 0; i < 8; i++) all &= cam[i].rec;
+  CHECK(all, "cameras recording 20 s after SOE");
+
+  printf("\n[10c] CAM_OFF in test mode closes the files first\n");
+  resetWorld();
+  powerOn();
+  at(-360, [] { send("ENTER_TEST_MODE"); });
+  at(-330, [] { send("CAM_OFF"); });
+  runUntil(-320);
+  CHECK(!cam[0].rec && near(camOffAfter(-331), -330 + CAM_STOP_MS / 1000.0, 0.1), "REC_STOP first, power cut %.1f s later", camOffAfter(-331) + 330);
+}
+
 int main() {
   flash = (uint8_t *)mmap((void *)(uintptr_t)XIP_BASE, 2 << 20, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -693,6 +747,7 @@ int main() {
   faults();
   tv();
   extras();
+  preflightRec();
   printf("\n%d/%d checks passed\n", checks - fails, checks);
   return fails != 0;
 }

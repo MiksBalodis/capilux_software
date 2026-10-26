@@ -141,7 +141,10 @@
   function stsText(d) {
     if (d.ok) return 'GO';
     const bad = STS_S.filter((_, i) => !((d.s >> i) & 1)).concat(STS_M.filter((_, i) => !((d.m >> i) & 1)));
-    if (d.c >= 0) for (let i = 0; i < 8; i++) if (!((d.c >> i) & 1)) bad.push('cam' + (i + 1));
+    if (d.c >= 0) for (let i = 0; i < 8; i++) {
+      if (!((d.c >> i) & 1)) bad.push('cam' + (i + 1));
+      else if (d.r >= 0 && !((d.r >> i) & 1)) bad.push('cam' + (i + 1) + ' not rec');
+    }
     return 'NO-GO: ' + bad.join(', ') + (d.c < 0 ? ' (cameras not checked)' : '');
   }
 
@@ -158,7 +161,7 @@
 <header>
   <div class="state">{st}</div>
   {#if tf != null && tf >= 0}<div class="flag on">SOE+{tf} s (T{tf + T_SOE_S >= 0 ? '+' : ''}{tf + T_SOE_S})</div>{/if}
-  {#if pk.STS}<div class="ok" class:good={pk.STS.d.ok} class:bad={!pk.STS.d.ok} title="last SELF_TEST, {time(pk.STS.at)}">{stsText(pk.STS.d)}</div>{/if}
+  {#if pk.STS}<div class="ok" class:good={pk.STS.d.ok} class:bad={!pk.STS.d.ok} title="last self-test (SELF_TEST or the final check at SOE), {time(pk.STS.at)}">{stsText(pk.STS.d)}</div>{/if}
   <div class="ok" class:good={hkOk} class:bad={!hkOk}>{hkOk ? 'HK OK' : fresh('HK') ? 'HK FAIL' : 'NO HK'}</div>
   <div class="flag" class:on={pk.STA?.d.soe} {...tip('soe')}>SOE</div>
   <div class="flag" class:on={pk.STA?.d.lo} {...tip('lo')}>LO</div>

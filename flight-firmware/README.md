@@ -28,17 +28,19 @@ Source: [`docs/firmware.drawio`](docs/firmware.drawio) (open in [diagrams.net](h
 
 ## Behaviour in short
 
-- States BOOT, STANDBY, TEST, ACTIVE, SHUTDOWN, SAFE. SOE starts the flight from STANDBY/SAFE; in TEST it waits until test mode ends (EXIT_TEST_MODE or the 5 min timeout), and the flight is still timed from the SOE edge. LO is only logged (by default).
-- Default timeline: SOE T-45 s, cameras record from SOE+5 s, record-stop T+577 s, cameras/LEDs off T+580 s, RXSM power-off T+600 s (REXUS UM; the SED v3.0 still says T+300 s).
-- SOE released before LO (hold): cameras stop, back to STANDBY, the next SOE starts a fresh run.
+- States BOOT, STANDBY, TEST, ACTIVE, SHUTDOWN, SAFE.
+- Timeline: power on T-600 s. `ENTER_TEST_MODE` at T-6:00 is the test: cameras on and recording, LEDs on, checks (GUI, SELF_TEST). `EXIT_TEST_MODE` (or the 5 min timeout) returns to STANDBY and the cameras keep recording. SOE at T-45 s starts the flight clock and sends the final checks as an STS packet plus a `GO` / `NOGO` event. Record-stop T+577 s, all off T+580 s, power-off T+600 s.
+- No test (e.g. no uplink): SOE switches the cameras on as a fallback.
+- SOE released before LO (hold): back to STANDBY, cameras keep recording, the next SOE starts a fresh flight clock. In TEST, SOE waits until test mode ends and the flight is still timed from the SOE edge.
 - After SHUTDOWN, a reset while SOE/LO are still asserted stays in SHUTDOWN until `REARM`. A boot with the signals released goes to STANDBY.
+- `CAM_OFF` / `ENTER_SAFE_MODE` stop recording first and cut camera power 3 s later. A watchdog reset during the pre-flight recording keeps the cameras running (`RESUME_REC`).
 - Telemetry at 5 Hz: STA, ACT, HK, CH1, CH2, BAR, ACC, GYR. CAM at 1 Hz. MEM and OBS on request.
 - SD: per-boot folder `/NNNN`, preallocated contiguous `HK.CSV` and `IMU.CSV`, never deletes files. SD failure is reported once, everything else continues.
 - Flash: last 512 KB as a ring buffer, 10 Hz records from SOE. `CLEAR_MEMORY` copies it to SD, then erases it.
 - Watchdog reset in ACTIVE resumes ACTIVE and keeps CAM_EN high. Power loss in ACTIVE with SOE/LO still asserted resumes with the time read back from the flash ring.
 - REC_START is repeated to any camera whose remaining recording time does not drop (CAM packet `rec` mask).
 - TV channel: with no command it cycles through the fitted cameras (10 s each). `TV 0`..`TV 7` holds one camera, `TV 8` resumes cycling; allowed in TEST and ACTIVE (view only, recording is not touched).
-- Events are downlinked as `{"t":"EVT","ms":..,"e":"SOE"}` (SOE, SOE_LATE, LO, REC_OK_n, SYNC_1, UG_START, UG_END, EXP_END, SOE_RELEASED, RESUME_WDT, RESUME_POWER, FLIGHT_DONE_LATCHED, TEST_TIMEOUT, SD_REINIT, I2Cn_RECOVER).
+- Events are downlinked as `{"t":"EVT","ms":..,"e":"SOE"}` (SOE, SOE_LATE, GO, NOGO, PREFLIGHT_REC, RESUME_REC, LO, REC_OK_n, SYNC_1, UG_START, UG_END, EXP_END, SOE_RELEASED, RESUME_WDT, RESUME_POWER, FLIGHT_DONE_LATCHED, TEST_TIMEOUT, SD_REINIT, I2Cn_RECOVER).
 
 ## Flight extras
 

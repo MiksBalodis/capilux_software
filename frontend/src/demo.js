@@ -42,10 +42,10 @@ export function createDemo(onPacket) {
       case 'GET_MEMORY_STATUS':
         emit({ t: 'MEM', sd: 1, sav: 0, bt: 42, n: Math.floor(ms() / 1000), fl: 504, er: 0 });
         return reply(line);
-      case 'ENTER_TEST_MODE': if (s.st !== 'STANDBY') return reply(line, 'STATE'); s.st = 'TEST'; return reply(line);
-      case 'SELF_TEST': emit({ t: 'STS', ms: ms(), ok: 0, s: 59, m: 15, c: s.cam ? 223 : -1 }); return reply(line);
+      case 'ENTER_TEST_MODE': if (s.st !== 'STANDBY') return reply(line, 'STATE'); s.st = 'TEST'; s.cam = 1; s.led = [255, 255, 255, 255]; return reply(line);
+      case 'SELF_TEST': emit({ t: 'STS', ms: ms(), ok: 0, s: 59, m: 15, c: s.cam ? 223 : -1, r: s.cam ? 223 : -1 }); return reply(line);
       case 'REARM': if (s.st !== 'SHUTDOWN') return reply(line, 'STATE'); s.st = 'STANDBY'; return reply(line);
-      case 'EXIT_TEST_MODE': if (!test) return reply(line, 'STATE'); allOff(); s.st = 'STANDBY'; return reply(line);
+      case 'EXIT_TEST_MODE': if (!test) return reply(line, 'STATE'); s.st = 'STANDBY'; return reply(line);  // cameras keep recording
       case 'ENTER_SAFE_MODE': if (s.st !== 'STANDBY' && !test) return reply(line, 'STATE'); allOff(); s.st = 'SAFE'; return reply(line);
       case 'EXIT_SAFE_MODE': if (s.st !== 'SAFE') return reply(line, 'STATE'); s.st = 'STANDBY'; return reply(line);
       case 'CLEAR_MEMORY':
@@ -73,7 +73,8 @@ export function createDemo(onPacket) {
   }
 
   // demo only: what the RXSM SOE / LO lines would do
-  function soe() { s.soe = 1; if (s.st === 'STANDBY' || s.st === 'SAFE') { s.st = 'ACTIVE'; s.soeAt = Date.now(); s.cam = 1; s.led = [255, 255, 255, 255]; } }
+  function soe() { s.soe = 1; if (s.st === 'STANDBY' || s.st === 'SAFE') { s.st = 'ACTIVE'; s.soeAt = Date.now(); s.cam = 1; s.led = [255, 255, 255, 255];
+    emit({ t: 'STS', ms: ms(), ok: 0, s: 59, m: 15, c: 223, r: 223 }); emit({ t: 'EVT', ms: ms(), e: 'NOGO' }); } }
   function lo() { s.lo = 1; }
 
   return { send, soe, lo, close: () => clearInterval(timer) };

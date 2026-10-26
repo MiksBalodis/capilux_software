@@ -18,13 +18,12 @@
 enum State : uint8_t { BOOT, STANDBY, TEST, ACTIVE, SHUTDOWN, SAFE };
 const char *const STATE_NAME[] = {"BOOT", "STANDBY", "TEST", "ACTIVE", "SHUTDOWN", "SAFE"};
 // Watchdog scratch 0..2 survive a watchdog reset (pico-sdk only uses 4..7), not a power cut.
-constexpr uint32_t MAGIC_ACTIVE = 0xCA710001, MAGIC_DONE = 0xCA710002;
+constexpr uint32_t MAGIC_ACTIVE = 0xCA710001, MAGIC_DONE = 0xCA710002, MAGIC_REC = 0xCA710003;  // REC: cameras recording before SOE
 constexpr uint8_t CAM_REC_START = 0x03, CAM_REC_STOP = 0x04;  // RunCam Device Protocol, camera control
 
 State state = BOOT;
 uint32_t tSoe, tLo, tSoeLastOn, tSoeRise, tCamOn, tStop, tClearArmed, tTestOn;
 bool recPending, stopping, clearArmed, loSeen, soeWasOn;
-State stopTo = SHUTDOWN;  // where the stop sequence ends: SHUTDOWN (end of flight) or STANDBY (SOE released before LO)
 uint32_t cmdRx, cmdBad;
 bool camOn;
 uint8_t led[4];
@@ -159,7 +158,7 @@ void selectTv(int sel) { tvSel = sel; tTvAuto = millis(); }
 
 // Every loop pass while the cameras are on: hold the chosen camera, or step through the fitted ones.
 void tvStep() {
-  if (!camOn || !(state == TEST || state == ACTIVE)) return;
+  if (!camOn) return;
   if (tvSel != TV_AUTO) { if (tvCh != tvSel) setTv(tvSel); return; }
   uint8_t fitted[8], n = 0;
   for (uint8_t i = 0; i < 8; i++) if (CAM_MASK >> i & 1) fitted[n++] = i;
@@ -168,6 +167,30 @@ void tvStep() {
 }
 
 void allOff() { setCam(false); for (int i = 0; i < 4; i++) setLed(i, 0); }
+void ledsAll(uint8_t v) { for (int i = 0; i < 4; i++) setLed(i, v); }
+
+// ---------- camera recording session ----------
+// Independent of the state: started by the test at T-6:00 (or by SOE as a fallback) and kept
+// running through the countdown and the flight. REC_START goes out once the cameras have booted,
+// and is repeated to any camera whose remaining recording time does not drop (#6).
+bool camStopping;      // REC_STOP sent, power is cut CAM_STOP_MS later (DVR closes its file)
+uint32_t tCamStop;
+void camRecStart();
+void camStart() {
+  camStopping = false;
+  if (camOn) return;   // already running: keep the recording and its confirmations
+  setCam(true);
+  recPending = true;
+  camTries = 0;
+}
+void camStop() {       // graceful: stop recording, cut power later in camService()
+  if (!camOn || camStopping) return;
+  camSendAll(CAM_REC_STOP);
+  camStopping = true;
+  recPending = false;
+  tCamStop = millis();
+}
+bool camRecording() { return camOn && !recPending && !camStopping; }
 
 // ---------- SD logging ----------
 // Files are created contiguous at full size on the ground, so flight writes only touch data
@@ -688,18 +711,21 @@ void sendObs() {
 // SELF_TEST: one GO / NO-GO packet.
 // s: bit0-3 chamber 1-4, bit4 barometer, bit5 IMU (63 = all)
 // m: bit0 SD HK file, bit1 SD IMU file, bit2 flash ring, bit3 supply 4.5-5.5 V (15 = all)
-// c: cameras that answered their last storage poll (-1 = cameras off, not checked)
-void sendSelfTest() {
+// c: cameras that answered their last storage poll, r: cameras confirmed recording
+//    (both -1 = cameras off, not checked; the final check at SOE counts that as NO-GO)
+bool sendSelfTest(bool final = false) {
   unsigned s = baroOk << 4 | imuOk << 5, m = hk.ok | imu.ok << 1 | flashOk << 2;
   for (int i = 0; i < 4; i++) s |= ch[i].ok << i;
   float v = vsys();
   m |= (v > 4.5f && v < 5.5f) << 3;
-  int c = -1;
-  if (camOn) { c = 0; for (int i = 0; i < 8; i++) c |= (camRemain[i] >= 0) << i; }
-  bool ok = s == 63 && m == 15 && (c < 0 || (c & CAM_MASK) == CAM_MASK);
-  snprintf(pk, sizeof pk, "{\"t\":\"STS\",\"ms\":%lu,\"ok\":%d,\"s\":%u,\"m\":%u,\"c\":%d}", millis(), ok, s, m, c);
+  int c = -1, r = -1;
+  if (camOn) { c = 0; for (int i = 0; i < 8; i++) c |= (camRemain[i] >= 0) << i; r = camRecOk; }
+  bool camsOk = c < 0 ? !final : (c & CAM_MASK) == CAM_MASK && (r & CAM_MASK) == CAM_MASK;
+  bool ok = s == 63 && m == 15 && camsOk;
+  snprintf(pk, sizeof pk, "{\"t\":\"STS\",\"ms\":%lu,\"ok\":%d,\"s\":%u,\"m\":%u,\"c\":%d,\"r\":%d}", millis(), ok, s, m, c, r);
   emit(pk);
-  logf(hk, "#STS,%lu,%d,%u,%u,%d\n", millis(), ok, s, m, c);
+  logf(hk, "#STS,%lu,%d,%u,%u,%d,%d\n", millis(), ok, s, m, c, r);
+  return ok;
 }
 
 // ---------- state machine ----------
@@ -753,11 +779,10 @@ void ugStep() {
 }
 
 void enterActive() {
-  setCam(true);
-  for (int i = 0; i < 4; i++) setLed(i, LED_FLIGHT);
-  recPending = true;
+  camStart();          // normally already recording since the test; this is the fallback (e.g. no uplink)
+  ledsAll(LED_FLIGHT);
   stopping = false;
-  camTries = 0;
+  camTries = 0;        // fresh retries for any camera that is still not confirmed
   tSoeLastOn = millis();  // a resume starts with SOE debounced "off": do not read that as a release
   selectTv(TV_DEFAULT_CH);
   syncInit();
@@ -770,6 +795,7 @@ void startFlight(uint32_t t0, const char *why) {
   tSoe = t0;
   event(why);
   enterActive();
+  event(sendSelfTest(true) ? "GO" : "NOGO");  // final checks at SOE: sensors, storage, all cameras recording
 }
 
 void camRecStart() {
@@ -781,7 +807,7 @@ void camRecStart() {
 
 // Called after every storage poll: recording is confirmed when the remaining time drops.
 void camCheck(uint8_t n, int32_t r) {
-  bool expect = state == ACTIVE && !recPending && !stopping;
+  bool expect = camRecording();
   if (expect && camPrev[n] >= 0 && r >= 0 && r < camPrev[n] && !(camRecOk >> n & 1)) {
     camRecOk |= 1 << n;
     char e[12];
@@ -791,47 +817,64 @@ void camCheck(uint8_t n, int32_t r) {
   camPrev[n] = r;
 }
 
-void runActive() {
-  uint32_t el = millis() - tSoe;
-  if (recPending && since(tCamOn) >= CAM_BOOT_MS) { camRecStart(); recPending = false; }
-
-  if (!stopping) {
-    bool released = SOE_DROP_ABORTS && !loSeen && since(tSoeLastOn) >= SOE_DROP_MS;
-    bool end;
-    if (END_FROM_LO) end = loSeen ? since(tLo) >= T_EXP_END_FROM_LO_MS : el >= T_EXP_END_MS + HOLD_ALLOWANCE_MS;
-    else end = el >= T_EXP_END_MS;
-    if (released || end) {
-      camSendAll(CAM_REC_STOP);
-      stopping = true;
-      tStop = millis();
-      stopTo = released ? STANDBY : SHUTDOWN;
-      event(released ? "SOE_RELEASED" : "EXP_END");
-    }
-  }
-  if (stopping && since(tStop) >= CAM_STOP_MS) {
-    allOff();
-    setState(stopTo);
-    flashMark();  // SHUTDOWN marks the flight done; STANDBY (after a hold) re-arms
-    logSync();
-    return;
-  }
-
-  syncStep(el);
-
-  // Closed loop (#6): resend REC_START (idempotent) to fitted cameras that have not confirmed.
+// Every loop pass: REC_START after boot, delayed power cut after REC_STOP, closed-loop retries.
+void camService() {
+  if (camOn && recPending && since(tCamOn) >= CAM_BOOT_MS) { camRecStart(); recPending = false; }
+  if (camStopping && since(tCamStop) >= CAM_STOP_MS) { setCam(false); camStopping = false; }
   uint8_t missing = CAM_MASK & ~camRecOk;
-  if (CAM_REC_CONFIRM && !recPending && !stopping && missing && camTries < CAM_MAX_RETRIES &&
-      since(tCamRetry) >= CAM_RETRY_MS) {
-    for (uint8_t n = 0; n < 8; n++) if (missing >> n & 1) camSend(n, CAM_REC_START);
+  if (CAM_REC_CONFIRM && camRecording() && missing && camTries < CAM_MAX_RETRIES && since(tCamRetry) >= CAM_RETRY_MS) {
+    for (uint8_t n = 0; n < 8; n++) if (missing >> n & 1) camSend(n, CAM_REC_START);  // idempotent
     camTries++;
     tCamRetry = millis();
     logf(hk, "#CAMRETRY,%lu,%u,%u\n", millis(), camTries, missing);
   }
 }
 
+void runActive() {
+  uint32_t el = millis() - tSoe;
+  if (!stopping) {
+    // SOE released before LO (hold / recycle): back to STANDBY and re-arm. The cameras keep
+    // recording, as they do before SOE; the next SOE starts a fresh flight clock.
+    if (SOE_DROP_ABORTS && !loSeen && since(tSoeLastOn) >= SOE_DROP_MS) {
+      event("SOE_RELEASED");
+      if (camOn) ledsAll(LED_FLIGHT);  // in case it happened during the sync flash
+      setState(STANDBY);
+      flashMark();
+      return;
+    }
+    bool end;
+    if (END_FROM_LO) end = loSeen ? since(tLo) >= T_EXP_END_FROM_LO_MS : el >= T_EXP_END_MS + HOLD_ALLOWANCE_MS;
+    else end = el >= T_EXP_END_MS;
+    if (end) {
+      camStop();
+      stopping = true;
+      tStop = millis();
+      event("EXP_END");
+    }
+  }
+  if (stopping && since(tStop) >= CAM_STOP_MS) {
+    allOff();
+    camStopping = false;
+    setState(SHUTDOWN);
+    flashMark();  // marks the flight done
+    logSync();
+    return;
+  }
+  syncStep(el);
+}
+
 void persist() {
-  watchdog_hw->scratch[0] = state == ACTIVE ? MAGIC_ACTIVE : state == SHUTDOWN ? MAGIC_DONE : 0;
+  watchdog_hw->scratch[0] = state == ACTIVE ? MAGIC_ACTIVE : state == SHUTDOWN ? MAGIC_DONE
+                           : camOn && !camStopping ? MAGIC_REC : 0;
   watchdog_hw->scratch[1] = millis() - tSoe;
+}
+
+// End of the test (EXIT_TEST_MODE or timeout): cameras keep recording through the countdown,
+// LEDs go to the flight level. Cameras that were switched off in the test stay off (SOE starts them).
+void endTest() {
+  ledsAll(camOn && !camStopping ? LED_FLIGHT : 0);
+  setState(STANDBY);
+  if (camOn && !camStopping) event("PREFLIGHT_REC");
 }
 
 // ---------- commands ----------
@@ -842,11 +885,18 @@ void handle(const char *line) {
   switch (c.id) {
     case C_BAD: err = "BAD_CMD"; break;
     case C_PING: break;
-    case C_TEST_ON: if (state == STANDBY) { tTestOn = millis(); selectTv(TV_DEFAULT_CH); setState(TEST); } else err = "STATE"; break;
-    case C_TV:  // view only (does not touch recording), so allowed in flight too (SED 4.x TV mux: "any flight phase")
-      if (state == TEST || state == ACTIVE) { selectTv(c.a); tvStep(); } else err = "STATE";
+    case C_TEST_ON:  // the pre-flight test (T-6:00): cameras on and recording, LEDs on, then check
+      if (state != STANDBY) { err = "STATE"; break; }
+      tTestOn = millis();
+      if (!camOn) selectTv(TV_DEFAULT_CH);
+      camStart();
+      ledsAll(LED_FLIGHT);
+      setState(TEST);
       break;
-    case C_TEST_OFF: if (state == TEST) { allOff(); setState(STANDBY); } else err = "STATE"; break;
+    case C_TV:  // view only (does not touch recording): allowed whenever the cameras are on
+      if (state == TEST || camOn) { selectTv(c.a); tvStep(); } else err = "STATE";
+      break;
+    case C_TEST_OFF: if (state == TEST) endTest(); else err = "STATE"; break;
     case C_STATUS: sendSta(); sendAct(); break;
     case C_HK: sendHk(); sendCh(0); sendCh(1); sendBar(); sendImu(); break;
     case C_OBS: sendObs(); sendCam(); break;
@@ -872,7 +922,7 @@ void handle(const char *line) {
       else { logEvent("FLASH_BACKUP"); flashWr = FLASH_LOG_OFS; eraseAt = FLASH_LOG_OFS; }
       clearArmed = false;
       break;
-    case C_SAFE_ON: if (state == STANDBY || state == TEST) { allOff(); setState(SAFE); } else err = "STATE"; break;
+    case C_SAFE_ON: if (state == STANDBY || state == TEST) { camStop(); ledsAll(0); setState(SAFE); } else err = "STATE"; break;
     case C_SAFE_OFF: if (state == SAFE) setState(STANDBY); else err = "STATE"; break;
     case C_REARM:  // leave the flight-done latch; a still-asserted SOE starts a new run at once (#3)
       if (state != SHUTDOWN) { err = "STATE"; break; }
@@ -889,13 +939,13 @@ void handle(const char *line) {
       emit("{\"t\":\"ACK\",\"cmd\":\"REBOOT\"}");
       drainTx(300);
       logSync();
-      watchdog_hw->scratch[0] = state == SHUTDOWN ? MAGIC_DONE : 0;  // REBOOT never re-arms a finished flight
+      watchdog_hw->scratch[0] = state == SHUTDOWN ? MAGIC_DONE : camOn && !camStopping ? MAGIC_REC : 0;  // never re-arms a finished flight; keeps a pre-flight recording going
       rp2040.reboot();
       break;
     default:  // camera and LED control: ground test mode only (O.2)
       if (state != TEST) { err = "STATE"; break; }
-      if (c.id == C_CAM_ON) setCam(true);
-      else if (c.id == C_CAM_OFF) setCam(false);
+      if (c.id == C_CAM_ON) camStart();
+      else if (c.id == C_CAM_OFF) camStop();  // graceful: files are closed before power is cut
       else if (c.id == C_LED_ALL) for (int i = 0; i < 4; i++) setLed(i, c.a);
       else if (c.id == C_LED) setLed(c.a - 1, c.b);
       else if (c.id == C_LED_OFF) for (int i = 0; i < 4; i++) setLed(i, 0);
@@ -948,8 +998,8 @@ void setup() {
   bool wdtReset = watchdog_caused_reboot();
   uint32_t magic = wdtReset ? watchdog_hw->scratch[0] : 0;
   uint32_t elapsed = watchdog_hw->scratch[1], tries = wdtReset ? watchdog_hw->scratch[2] : 0;
-  bool resumeWdt = magic == MAGIC_ACTIVE;
-  pinMode(PIN_CAM_EN, OUTPUT); digitalWrite(PIN_CAM_EN, resumeWdt);
+  bool resumeWdt = magic == MAGIC_ACTIVE, resumeRec = magic == MAGIC_REC;
+  pinMode(PIN_CAM_EN, OUTPUT); digitalWrite(PIN_CAM_EN, resumeWdt || resumeRec);
 
   // 595 next: OE has no pull-up, so outputs come up enabled with random bits. Disable both muxes.
   pinMode(PIN_OE, OUTPUT); digitalWrite(PIN_OE, HIGH);
@@ -959,7 +1009,7 @@ void setup() {
 
   analogWriteFreq(20000);  // well above camera frame rate, no banding
   analogWriteRange(255);
-  for (int i = 0; i < 4; i++) setLed(i, resumeWdt ? LED_FLIGHT : 0);  // lights back before the slow SD setup
+  for (int i = 0; i < 4; i++) setLed(i, resumeWdt || resumeRec ? LED_FLIGHT : 0);  // lights back before the slow SD setup
   for (int p : PIN_TV) pinMode(p, OUTPUT);
   setTv(0);
   pinMode(PIN_SOE, INPUT); pinMode(PIN_LO, INPUT);  // external 10k pull-ups
@@ -1013,7 +1063,10 @@ void setup() {
   if (r == R_WDT) event("RESUME_WDT");
   else if (r == R_POWER) event("RESUME_POWER");
   else if (r == R_DONE) { setState(SHUTDOWN); event("FLIGHT_DONE_LATCHED"); }
-  else setState(STANDBY);
+  else {
+    setState(STANDBY);
+    if (resumeRec) { camStart(); event("RESUME_REC"); }  // reset during the pre-flight recording: keep recording
+  }
 }
 
 void loop() {
@@ -1030,8 +1083,7 @@ void loop() {
   if (lo.on && !loSeen) { loSeen = true; tLo = now; event("LO"); }
 
   if (state == TEST && TEST_TIMEOUT_MS && since(tTestOn) >= TEST_TIMEOUT_MS) {  // #7
-    allOff();
-    setState(STANDBY);
+    endTest();
     event("TEST_TIMEOUT");
   }
   // SOE starts the flight from STANDBY or SAFE, not from TEST (SED 4.9.6). SOE is checked as a
@@ -1042,6 +1094,7 @@ void loop() {
   else if (LO_BACKUP_START && lo.on && (state == STANDBY || state == SAFE || state == TEST))
     startFlight(soe.on ? tSoeRise : now - (uint32_t)(-T_SOE_S * 1000), "LO_BACKUP_START");  // else as if SOE came on time
   if (clearArmed && since(tClearArmed) > CLEAR_WINDOW_MS) clearArmed = false;
+  camService();
   if (state == ACTIVE) runActive();
   tvStep();
   persist();
@@ -1056,7 +1109,7 @@ void loop() {
     sendSta(); sendAct(); sendHk(); sendCh(0); sendCh(1); sendBar(); sendImu();
   }
   if (state == ACTIVE && since(tFlash) >= FLASH_REC_MS) { tFlash = millis(); flashLog(); }
-  if (camOn && (state == TEST || state == ACTIVE) && !stopping && since(tCamOn) >= CAM_BOOT_MS &&
+  if (camOn && !camStopping && since(tCamOn) >= CAM_BOOT_MS &&
       since(tCamPoll) >= 1000) {  // cameras must be booted; nothing else uses the camera UART then
     tCamPoll = millis();
     int32_t rem = camQueryRemaining(camPoll);
